@@ -1,31 +1,53 @@
 #include <assert.h>
 #include <errno.h>
-#include <netinet/in.h>
-#define __USE_GNU
-#include <poll.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define __USE_GNU
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #define PORT 8080
+#define POOL_COUNT 3
 #define LISTEN_BACKLOG 50
 
-static void client_handler_thread() {
+static void thread_pool_thread(int threadIndex) {
+	char *prefix;
+	asprintf(&prefix, "Thread %d:", threadIndex);
 
+	printf("%s started\n", prefix);
+
+	while (1) {
+		sleep(1);
+	}
 }
 
-static void handle_new_client(int fd, struct sockaddr addr, socklen_t addr_len) {
+static void start_thread_pool() {
+	for (int i = 0; i < POOL_COUNT; i++) {
+		pthread_t thread_id;
+		// look at this shit, an abomination of a function ptr
+		if (pthread_create(&thread_id, NULL, (void *(*)(void *)) & thread_pool_thread, (void *)i) != 0) {
+			perror("pthread_create");
+			exit(1);
+		}
+	}
+}
+
+static void new_client(int fd, struct sockaddr addr, socklen_t addr_len) {
 	// Since we want to serve files...
 	// http/1.0, dont want multiple http reqeuests per tcp request.
 
 	/*
 
 		accept thread
-		client handler thread (reads the request, interprets it, fetches the file and waits for it to be avaliable and passes it back to client, with epoll)
+		client handler thread (reads the request, interprets it, fetches the file and waits for it to be avaliable and
+	   passes it back to client, with epoll)
 
 		we must read the request from fd, might be short or long.
 		then we interpret it,
@@ -63,55 +85,57 @@ static void handle_new_client(int fd, struct sockaddr addr, socklen_t addr_len) 
 // }
 
 volatile sig_atomic_t running = 1;
-static void handle_sigint(int signum) {
-	running = 0;
-}
+static void handle_sigint(int signum) { running = 0; }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
 	assert(argc > 0);
 	if (argc != 2) {
-		printf(
-			"Usage: %s <dir path>\n"
-			"where dir path is the dir you want to serve",
-			argv[0]);
-		exit(0);
+		printf("Usage: %s <path>\n"
+			   "where <path> is the dir to serve",
+			   argv[0]);
+		return 0;
 	}
 
-	char* path = argv[1];
+	char *path = argv[1];
 
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (server_fd == -1) {
 		perror("socket");
-		exit(1);
+		return 1;
 	}
 
 	int reuseaddropt = 1;
 	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddropt, sizeof(reuseaddropt)) == -1) {
 		perror("setsockopt SO_REUSEADDR");
-		exit(1);
+		return 1;
 	}
 
 	struct sockaddr_in server_addr = {
 		.sin_family = AF_INET,
+
 		// htons converts host byte order (little-endian)
 		// to network byte order short (big-endian)
-		.sin_port = htons(8080),
+		.sin_port = htons(PORT),
+
 		// htonl converts host byte order (little-endian)
 		// to network byte order long
 		.sin_addr = {.s_addr = htonl(INADDR_ANY)},
 	};
 
-	if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+	if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
 		perror("bind");
-		exit(1);
+		return 1;
 	}
 
 	if (listen(server_fd, LISTEN_BACKLOG) == -1) {
 		perror("listen");
-		exit(1);
+		return 1;
 	}
 
-	signal(SIGINT, &handle_sigint);
+	start_thread_pool();
+
+	struct sigaction sa = {.sa_handler = &handle_sigint};
+	sigaction(SIGINT, &sa, NULL);
 	printf("Listening on port %i (CTRL+C to exit)\n", PORT);
 
 	int client_fd;
@@ -127,11 +151,9 @@ int main(int argc, char** argv) {
 			continue;
 		}
 
-		// This can only handle 1 client at a time, i can make it 1 thread per
-		// client, or a pool. maybe ill do a pool later.
-		handle_client(client_fd, client_addr, client_addr_len);
+		new_client(client_fd, client_addr, client_addr_len);
 	}
 
-	printf("byeeeee!!\n");
-	return 1;
+	printf(" byeeeee!!\n");
+	return 0;
 }

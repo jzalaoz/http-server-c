@@ -3,10 +3,10 @@
 all: clean build test
 
 build:
-	gcc -o server main.c -pthread
+	gcc -o main main.c -pthread
 
 test:
-	./server
+	./main ./public
 
 clean:
-	rm server -f
+	rm main -f
