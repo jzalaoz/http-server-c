@@ -12,7 +12,11 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/sendfile.h>
+#include <dirent.h>
 
 #define PORT 8080
 #define POOL_COUNT 3
@@ -20,10 +24,10 @@
 #define MAX_REQUEST_HEADER_SIZE 16384
 
 #define HTTP_OK "HTTP/1.0 200\r\n"
+#define HTTP_BAD_REQ "HTTP/1.0 400\r\n"
+
 #define HTTP_SERVER "server: china\r\n"
 #define HTTP_CACHE "cache-control: private, no-store\r\n"
-
-#define HTTP_BAD_REQ "HTTP/1.0 400\r\n\r\nBAD_REQUEST"
 
 typedef struct {
 	int fd;
@@ -32,10 +36,20 @@ typedef struct {
 } job_t;
 
 static char *rootPathName;
+static size_t rootPathNameLen;
 
-static void bad_request(job_t *job) {
-	static const char res[] = HTTP_BAD_REQ;
-	write(job->fd, res, sizeof(res) - 1);
+static void bad_request(job_t *job, char *err) {
+	if (err == NULL) {
+		err = "bad request";
+	}
+	// minus 1 cause NULL TERMINATOR at end of HTTP_BAD_REQ, i hate c strings
+	size_t size = sizeof(HTTP_BAD_REQ) - 1 + 2 + strlen(err);
+	char *res = malloc(size);
+	strcpy(res, HTTP_BAD_REQ);
+	strcpy(res + sizeof(HTTP_BAD_REQ) - 1, "\r\n");
+	strcpy(res + sizeof(HTTP_BAD_REQ) - 1 + 2, err);
+	write(job->fd, res, size);
+	free(res);
 	close(job->fd);
 }
 
@@ -44,25 +58,110 @@ static void interpret_request(job_t *job, char *buffer, size_t buffer_len) {
 	size_t remaining = buffer_len;
 
 	// 3 ("GET") + 1 (" ") + 1 (FIRST CHAR OF PATH)
-	if (remaining < 5 || strncmp(head, "GET", 3) != 0) {
-		return bad_request(job);
+	if (remaining < 5 || strncmp(head, "GET ", 4) != 0) {
+		return bad_request(job, "ERROR: invalid header");
 	}
-	// Skip "GET" and SPACE
+	// Skip "GET "
 	head += 4;
 	remaining -= 4;
 
 	char *path_head = head;
-	while (remaining > 0 && head[0] != ' ' && head[0] != '\r' && head[0] != '\n') {
+	size_t path_len = 0;
+	while (remaining > 0 && head[0] != ' ' && head[0] != '\r' && head[0] != '\n' && head[0] != '\0') {
+		path_len++;
 		head++;
 		remaining--;
 	}
-	char path[head - path_head] = {};
-	strncpy(path, path_head, sizeof(path));
+	char path[path_len + 1] = {};
+	strncpy(path, path_head, path_len);
 
+	char *rel_path = malloc(rootPathNameLen + path_len + 1);
+	strncpy(rel_path, rootPathName, rootPathNameLen);
+	memcpy(rel_path + rootPathNameLen, path, path_len);
+	rel_path[rootPathNameLen + path_len] = '\0';
+	char *abs_path = realpath(rel_path, NULL);
+	if (abs_path == NULL) {
+		char *ptr;
+		asprintf(&ptr, "realpath (\"%s\")", rel_path);
+		perror(ptr);
+		free(ptr);
+		free(rel_path);
+		bad_request(job, "ERROR: invalid path");
+		return;
+	}
+	free(rel_path);
+	if (strncmp(rootPathName, abs_path, rootPathNameLen) != 0) {
+		bad_request(job, "ERROR: out of bounds path");
+		goto clean;
+	}
+	rel_path = abs_path + rootPathNameLen;
+
+	// Now we have the abs_path, we just send it to client
 	static const char res_header[] = HTTP_OK HTTP_SERVER HTTP_CACHE "content-type: text/html\r\n\r\n";
 	write(job->fd, res_header, sizeof(res_header));
 
-	write(job->fd, path, sizeof(path));
+	struct stat st;
+	if (stat(abs_path, &st) == -1) {
+		perror("stat");
+		bad_request(job, "internal error with calling stat on your path");
+		goto clean;
+	}
+
+	if (S_ISREG(st.st_mode)) {
+		// is file, we already know abs_path exists
+		int fd = open(abs_path, O_RDONLY);
+		off_t len = lseek(fd, 0, SEEK_END);
+		lseek(fd, 0, SEEK_SET);
+
+		off_t offset = 0;
+		ssize_t n;
+		while (1) {
+			n = sendfile(job->fd, fd, &offset, len - offset);
+			if (n == -1) {
+				perror("sendfile");
+				close(fd);
+				bad_request(job, "internal error with sendfile libc call");
+				goto clean;
+			} else if (n == 0) {
+				break;
+			}
+		}
+		close(fd);
+	} else if (S_ISDIR(st.st_mode)) {
+		DIR *dir = opendir(abs_path);
+		if (dir == NULL) {
+			perror("opendir");
+			bad_request(job, "internal error while sending index view with opendir libc call");
+			goto clean;
+		}
+
+		while (1) {
+			errno = 0;
+			struct dirent *entry = readdir(dir);
+			if (entry == NULL) {
+				if (errno == 0) {
+					break;
+				} else {
+					perror("readdir");
+					bad_request(job, "internal error while sending index view with readdir libc call");
+					goto clean;
+				}
+			}
+
+			char *str;
+			asprintf(&str, "<a href=\"%s/%s\">%s</a>\n", rel_path, entry->d_name, entry->d_name);
+			write(job->fd, str, strlen(str));
+		}
+
+		closedir(dir);
+	} else {
+		bad_request(job, "not a file or dir?");
+		goto clean;
+	}
+
+clean:
+	free(abs_path);
+	close(job->fd);
 }
 
 static ssize_t read_request(job_t *job, char *buffer, size_t buffer_max) {
@@ -131,11 +230,19 @@ int main(int argc, char **argv) {
 		return 0;
 	}
 
-	rootPathName = argv[1];
-	if (opendir(rootPathName) == NULL) {
+	if (opendir(argv[1]) == NULL) {
 		perror("opendir");
 		return 1;
 	}
+	rootPathName = realpath(argv[1], NULL);
+	if (rootPathName == NULL) {
+		char *ptr;
+		sprintf(ptr, "realpath (%s)", argv[1]);
+		perror(ptr);
+		free(ptr);
+		return 1;
+	}
+	rootPathNameLen = strlen(rootPathName);
 
 	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (server_fd == -1) {
